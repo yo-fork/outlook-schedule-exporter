@@ -1,0 +1,14 @@
+{
+  "OutputDirectory": "\\\\fileserver\\share\\schedule",
+  "HtmlFileName": "schedule.html",
+  "CsvFileName": "schedule.csv",
+  "LogFileName": "schedule.log",
+  "DaysAhead": 14,
+  "Title": "Outlook Schedule",
+  "WriteCsv": true,
+  "MaskPrivateItems": true,
+  "IncludeLocation": true,
+  "IncludeBusyStatus": true,
+  "DateFormat": "yyyy/MM/dd",
+  "TimeFormat": "HH:mm"
+}

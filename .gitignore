@@ -1,0 +1,16 @@
+# Local configuration
+config.json
+
+# Generated files
+*.log
+schedule.html
+schedule.csv
+*.tmp
+
+# Windows
+Thumbs.db
+Desktop.ini
+
+# Editor
+.vscode/
+.idea/
