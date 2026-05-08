@@ -21,6 +21,12 @@ function Get-ConfigValue {
     return $DefaultValue
 }
 
+function Normalize-Text {
+    param([AllowNull()][string]$Text)
+    if ($null -eq $Text) { return "" }
+    return (($Text -replace "`r`n", "`n") -replace "`r", "`n").Trim()
+}
+
 function Get-ComText {
     param([object]$Object, [string]$PropertyName, [string]$DefaultValue = "")
     try {
@@ -48,12 +54,6 @@ function Get-ComInt {
     } catch { return $DefaultValue }
 }
 
-function Normalize-Text {
-    param([AllowNull()][string]$Text)
-    if ($null -eq $Text) { return "" }
-    return (($Text -replace "`r`n", "`n") -replace "`r", "`n").Trim()
-}
-
 function Get-BodyPreview {
     param([AllowNull()][string]$Body, [int]$MaxLength = 700)
     $text = Normalize-Text $Body
@@ -78,6 +78,52 @@ function HtmlEncode {
     return [System.Net.WebUtility]::HtmlEncode($Text)
 }
 
+function Get-OutlookCalendarFolderType {
+    # Outlook COM の GetDefaultFolder / GetSharedDefaultFolder は環境によって、
+    # 生の 9 だと「引数の型が一致しません」になることがある。
+    # PIA enum が使える場合は enum を使い、使えない場合だけ int にフォールバックする。
+    try {
+        Add-Type -AssemblyName "Microsoft.Office.Interop.Outlook" -ErrorAction Stop | Out-Null
+        return [Microsoft.Office.Interop.Outlook.OlDefaultFolders]::olFolderCalendar
+    } catch {
+        return [int]9
+    }
+}
+
+function Get-DefaultCalendarFolder {
+    param([object]$Namespace)
+    $folderType = Get-OutlookCalendarFolderType
+    try {
+        return $Namespace.GetDefaultFolder($folderType)
+    } catch {
+        Write-Log "GetDefaultFolder with enum failed: $($_.Exception.Message)" "WARN"
+        return $Namespace.GetDefaultFolder([int]9)
+    }
+}
+
+function Get-SharedCalendarFolder {
+    param([object]$Namespace, [object]$Recipient)
+    $folderType = Get-OutlookCalendarFolderType
+    try {
+        return $Namespace.GetSharedDefaultFolder($Recipient, $folderType)
+    } catch {
+        Write-Log "GetSharedDefaultFolder with enum failed: $($_.Exception.Message)" "WARN"
+        try {
+            return $Namespace.GetSharedDefaultFolder($Recipient, [int]9)
+        } catch {
+            Write-Log "GetSharedDefaultFolder with int failed: $($_.Exception.Message)" "WARN"
+            # 最後に late binding で呼ぶ。COM の型変換差異を吸収できる場合がある。
+            return $Namespace.GetType().InvokeMember(
+                "GetSharedDefaultFolder",
+                [System.Reflection.BindingFlags]::InvokeMethod,
+                $null,
+                $Namespace,
+                @($Recipient, $folderType)
+            )
+        }
+    }
+}
+
 function Get-CalendarTargets {
     param([object]$Config, [object]$Namespace)
 
@@ -93,7 +139,7 @@ function Get-CalendarTargets {
                 Email = ""
                 Key = "default"
                 Kind = "default"
-                Folder = $Namespace.GetDefaultFolder(9)
+                Folder = (Get-DefaultCalendarFolder -Namespace $Namespace)
             })
             Write-Log "Default calendar added: $defaultName"
         } catch {
@@ -104,6 +150,7 @@ function Get-CalendarTargets {
     foreach ($entry in @($shared)) {
         $email = ""
         $name = ""
+
         if ($entry -is [string]) {
             $email = [string]$entry
             $name = [string]$entry
@@ -119,12 +166,13 @@ function Get-CalendarTargets {
 
         try {
             $recipient = $Namespace.CreateRecipient($email)
-            if (-not $recipient.Resolve()) {
+            $resolved = [bool]$recipient.Resolve()
+            if (-not $resolved) {
                 Write-Log "Could not resolve shared calendar recipient: $email" "WARN"
                 continue
             }
 
-            $folder = $Namespace.GetSharedDefaultFolder($recipient, 9)
+            $folder = Get-SharedCalendarFolder -Namespace $Namespace -Recipient $recipient
             if ([string]::IsNullOrWhiteSpace($name)) { $name = [string]$recipient.Name }
             if ([string]::IsNullOrWhiteSpace($name)) { $name = $email }
 
@@ -144,6 +192,114 @@ function Get-CalendarTargets {
     return @($targets)
 }
 
+function Add-AppointmentRow {
+    param(
+        [object]$Rows,
+        [object]$Appointment,
+        [object]$Target,
+        [datetime]$RangeStart,
+        [datetime]$RangeEnd,
+        [int]$Index,
+        [hashtable]$Settings
+    )
+
+    $startDt = [datetime]$Appointment.Start
+    $endDt = [datetime]$Appointment.End
+    if ($endDt -lt $RangeStart -or $startDt -ge $RangeEnd) { return $Index }
+
+    $busyMap = @{ 0 = "空き"; 1 = "仮予定"; 2 = "予定あり"; 3 = "外出中"; 4 = "他の場所で作業中" }
+    $importanceMap = @{ 0 = "低"; 1 = "標準"; 2 = "高" }
+    $meetingStatusMap = @{ 0 = "通常予定"; 1 = "会議"; 3 = "受信した会議"; 5 = "キャンセルされた会議" }
+
+    $isPrivate = (Get-ComInt -Object $Appointment -PropertyName "Sensitivity" -DefaultValue 0) -eq 2
+    $shouldMask = $Settings.MaskPrivateItems -and $isPrivate
+    $allDay = Get-ComBool -Object $Appointment -PropertyName "AllDayEvent" -DefaultValue $false
+
+    $rawSubject = Get-ComText -Object $Appointment -PropertyName "Subject"
+    $rawLocation = Get-ComText -Object $Appointment -PropertyName "Location"
+    $rawOrganizer = Get-ComText -Object $Appointment -PropertyName "Organizer"
+    $rawRequired = Get-ComText -Object $Appointment -PropertyName "RequiredAttendees"
+    $rawOptional = Get-ComText -Object $Appointment -PropertyName "OptionalAttendees"
+    $rawCategories = Get-ComText -Object $Appointment -PropertyName "Categories"
+    $rawBody = Get-ComText -Object $Appointment -PropertyName "Body"
+
+    if ($shouldMask) {
+        $subject = "非公開予定"
+        $location = ""
+        $organizer = ""
+        $requiredAttendees = ""
+        $optionalAttendees = ""
+        $categories = ""
+        $bodyPreview = ""
+    } else {
+        $subject = if ([string]::IsNullOrWhiteSpace($rawSubject)) { "(件名なし)" } else { $rawSubject }
+        $location = if ($Settings.IncludeLocation) { $rawLocation } else { "" }
+        $organizer = if ($Settings.IncludeOrganizer) { $rawOrganizer } else { "" }
+        $requiredAttendees = if ($Settings.IncludeAttendees) { $rawRequired } else { "" }
+        $optionalAttendees = if ($Settings.IncludeAttendees) { $rawOptional } else { "" }
+        $categories = if ($Settings.IncludeCategories) { $rawCategories } else { "" }
+        $bodyPreview = if ($Settings.IncludeBodyPreview) { Get-BodyPreview -Body $rawBody -MaxLength $Settings.BodyPreviewMaxLength } else { "" }
+    }
+
+    $busyStatus = ""
+    if ($Settings.IncludeBusyStatus) {
+        $busyKey = Get-ComInt -Object $Appointment -PropertyName "BusyStatus" -DefaultValue -1
+        if ($busyMap.ContainsKey($busyKey)) { $busyStatus = $busyMap[$busyKey] }
+    }
+
+    $importance = ""
+    $importanceKey = Get-ComInt -Object $Appointment -PropertyName "Importance" -DefaultValue -1
+    if ($importanceMap.ContainsKey($importanceKey)) { $importance = $importanceMap[$importanceKey] }
+
+    $meetingStatus = ""
+    $meetingStatusKey = Get-ComInt -Object $Appointment -PropertyName "MeetingStatus" -DefaultValue -1
+    if ($meetingStatusMap.ContainsKey($meetingStatusKey)) { $meetingStatus = $meetingStatusMap[$meetingStatusKey] }
+
+    $reminderText = ""
+    if ($Settings.IncludeReminder -and (Get-ComBool -Object $Appointment -PropertyName "ReminderSet" -DefaultValue $false)) {
+        $reminderText = "{0} 分前" -f (Get-ComInt -Object $Appointment -PropertyName "ReminderMinutesBeforeStart" -DefaultValue 0)
+    }
+
+    $attendeeCount = 0
+    foreach ($text in @($requiredAttendees, $optionalAttendees)) {
+        if (-not [string]::IsNullOrWhiteSpace($text)) {
+            $attendeeCount += @($text -split ";" | Where-Object { -not [string]::IsNullOrWhiteSpace($_) }).Count
+        }
+    }
+
+    $Rows.Add([PSCustomObject]@{
+        id = $Index
+        calendarName = [string]$Target.Name
+        calendarEmail = [string]$Target.Email
+        calendarKey = [string]$Target.Key
+        calendarKind = [string]$Target.Kind
+        startISO = $startDt.ToString("yyyy-MM-ddTHH:mm:ss")
+        endISO = $endDt.ToString("yyyy-MM-ddTHH:mm:ss")
+        date = $startDt.ToString("yyyy-MM-dd")
+        startHM = if ($allDay) { "終日" } else { $startDt.ToString("HH:mm") }
+        endHM = if ($allDay) { "" } else { $endDt.ToString("HH:mm") }
+        subject = Normalize-Text $subject
+        location = Normalize-Text $location
+        organizer = Normalize-Text $organizer
+        requiredAttendees = Normalize-Text $requiredAttendees
+        optionalAttendees = Normalize-Text $optionalAttendees
+        attendeeCount = $attendeeCount
+        categories = Normalize-Text $categories
+        bodyPreview = Normalize-Text $bodyPreview
+        isPrivate = $isPrivate
+        isMasked = $shouldMask
+        allDay = $allDay
+        busyStatus = $busyStatus
+        importance = $importance
+        meetingStatus = $meetingStatus
+        reminder = $reminderText
+        isRecurring = (Get-ComBool -Object $Appointment -PropertyName "IsRecurring" -DefaultValue $false)
+        durationMinutes = [int][Math]::Round(($endDt - $startDt).TotalMinutes)
+    })
+
+    return ($Index + 1)
+}
+
 try {
     if (-not (Test-Path -LiteralPath $ConfigPath)) { throw "Config file not found: $ConfigPath" }
     $config = Get-Content -LiteralPath $ConfigPath -Raw -Encoding UTF8 | ConvertFrom-Json
@@ -155,15 +311,18 @@ try {
     $daysAhead = [int](Get-ConfigValue -Config $config -Name "DaysAhead" -DefaultValue 14)
     $title = [string](Get-ConfigValue -Config $config -Name "Title" -DefaultValue "Outlook Schedule")
     $writeCsv = [bool](Get-ConfigValue -Config $config -Name "WriteCsv" -DefaultValue $true)
-    $maskPrivateItems = [bool](Get-ConfigValue -Config $config -Name "MaskPrivateItems" -DefaultValue $true)
-    $includeLocation = [bool](Get-ConfigValue -Config $config -Name "IncludeLocation" -DefaultValue $true)
-    $includeBusyStatus = [bool](Get-ConfigValue -Config $config -Name "IncludeBusyStatus" -DefaultValue $true)
-    $includeOrganizer = [bool](Get-ConfigValue -Config $config -Name "IncludeOrganizer" -DefaultValue $true)
-    $includeAttendees = [bool](Get-ConfigValue -Config $config -Name "IncludeAttendees" -DefaultValue $true)
-    $includeBodyPreview = [bool](Get-ConfigValue -Config $config -Name "IncludeBodyPreview" -DefaultValue $false)
-    $bodyPreviewMaxLength = [int](Get-ConfigValue -Config $config -Name "BodyPreviewMaxLength" -DefaultValue 700)
-    $includeCategories = [bool](Get-ConfigValue -Config $config -Name "IncludeCategories" -DefaultValue $true)
-    $includeReminder = [bool](Get-ConfigValue -Config $config -Name "IncludeReminder" -DefaultValue $true)
+
+    $settings = @{
+        MaskPrivateItems = [bool](Get-ConfigValue -Config $config -Name "MaskPrivateItems" -DefaultValue $true)
+        IncludeLocation = [bool](Get-ConfigValue -Config $config -Name "IncludeLocation" -DefaultValue $true)
+        IncludeBusyStatus = [bool](Get-ConfigValue -Config $config -Name "IncludeBusyStatus" -DefaultValue $true)
+        IncludeOrganizer = [bool](Get-ConfigValue -Config $config -Name "IncludeOrganizer" -DefaultValue $true)
+        IncludeAttendees = [bool](Get-ConfigValue -Config $config -Name "IncludeAttendees" -DefaultValue $true)
+        IncludeBodyPreview = [bool](Get-ConfigValue -Config $config -Name "IncludeBodyPreview" -DefaultValue $false)
+        BodyPreviewMaxLength = [int](Get-ConfigValue -Config $config -Name "BodyPreviewMaxLength" -DefaultValue 700)
+        IncludeCategories = [bool](Get-ConfigValue -Config $config -Name "IncludeCategories" -DefaultValue $true)
+        IncludeReminder = [bool](Get-ConfigValue -Config $config -Name "IncludeReminder" -DefaultValue $true)
+    }
 
     if ($daysAhead -lt 0) { throw "DaysAhead must be greater than or equal to 0." }
 
@@ -188,10 +347,6 @@ try {
     $endText = $rangeEnd.ToString("MM/dd/yyyy hh:mm tt", $culture)
     $filter = "[End] >= '$startText' AND [Start] < '$endText'"
 
-    $busyMap = @{ 0 = "空き"; 1 = "仮予定"; 2 = "予定あり"; 3 = "外出中"; 4 = "他の場所で作業中" }
-    $importanceMap = @{ 0 = "低"; 1 = "標準"; 2 = "高" }
-    $meetingStatusMap = @{ 0 = "通常予定"; 1 = "会議"; 3 = "受信した会議"; 5 = "キャンセルされた会議" }
-
     $rows = New-Object System.Collections.Generic.List[object]
     $index = 0
 
@@ -209,92 +364,7 @@ try {
 
         foreach ($appointment in $restricted) {
             try {
-                $startDt = [datetime]$appointment.Start
-                $endDt = [datetime]$appointment.End
-                if ($endDt -lt $rangeStart -or $startDt -ge $rangeEnd) { continue }
-
-                $isPrivate = (Get-ComInt -Object $appointment -PropertyName "Sensitivity" -DefaultValue 0) -eq 2
-                $shouldMask = $maskPrivateItems -and $isPrivate
-                $allDay = Get-ComBool -Object $appointment -PropertyName "AllDayEvent" -DefaultValue $false
-
-                $rawSubject = Get-ComText -Object $appointment -PropertyName "Subject"
-                $rawLocation = Get-ComText -Object $appointment -PropertyName "Location"
-                $rawOrganizer = Get-ComText -Object $appointment -PropertyName "Organizer"
-                $rawRequired = Get-ComText -Object $appointment -PropertyName "RequiredAttendees"
-                $rawOptional = Get-ComText -Object $appointment -PropertyName "OptionalAttendees"
-                $rawCategories = Get-ComText -Object $appointment -PropertyName "Categories"
-                $rawBody = Get-ComText -Object $appointment -PropertyName "Body"
-
-                if ($shouldMask) {
-                    $subject = "非公開予定"; $location = ""; $organizer = ""; $requiredAttendees = ""; $optionalAttendees = ""; $categories = ""; $bodyPreview = ""
-                } else {
-                    $subject = if ([string]::IsNullOrWhiteSpace($rawSubject)) { "(件名なし)" } else { $rawSubject }
-                    $location = if ($includeLocation) { $rawLocation } else { "" }
-                    $organizer = if ($includeOrganizer) { $rawOrganizer } else { "" }
-                    $requiredAttendees = if ($includeAttendees) { $rawRequired } else { "" }
-                    $optionalAttendees = if ($includeAttendees) { $rawOptional } else { "" }
-                    $categories = if ($includeCategories) { $rawCategories } else { "" }
-                    $bodyPreview = if ($includeBodyPreview) { Get-BodyPreview -Body $rawBody -MaxLength $bodyPreviewMaxLength } else { "" }
-                }
-
-                $busyStatus = ""
-                if ($includeBusyStatus) {
-                    $busyKey = Get-ComInt -Object $appointment -PropertyName "BusyStatus" -DefaultValue -1
-                    if ($busyMap.ContainsKey($busyKey)) { $busyStatus = $busyMap[$busyKey] }
-                }
-
-                $importance = ""
-                $importanceKey = Get-ComInt -Object $appointment -PropertyName "Importance" -DefaultValue -1
-                if ($importanceMap.ContainsKey($importanceKey)) { $importance = $importanceMap[$importanceKey] }
-
-                $meetingStatus = ""
-                $meetingStatusKey = Get-ComInt -Object $appointment -PropertyName "MeetingStatus" -DefaultValue -1
-                if ($meetingStatusMap.ContainsKey($meetingStatusKey)) { $meetingStatus = $meetingStatusMap[$meetingStatusKey] }
-
-                $reminderText = ""
-                if ($includeReminder -and (Get-ComBool -Object $appointment -PropertyName "ReminderSet" -DefaultValue $false)) {
-                    $reminderText = "{0} 分前" -f (Get-ComInt -Object $appointment -PropertyName "ReminderMinutesBeforeStart" -DefaultValue 0)
-                }
-
-                $durationMinutes = [int][Math]::Round(($endDt - $startDt).TotalMinutes)
-                $isRecurring = Get-ComBool -Object $appointment -PropertyName "IsRecurring" -DefaultValue $false
-                $attendeeCount = 0
-                foreach ($text in @($requiredAttendees, $optionalAttendees)) {
-                    if (-not [string]::IsNullOrWhiteSpace($text)) {
-                        $attendeeCount += @($text -split ";" | Where-Object { -not [string]::IsNullOrWhiteSpace($_) }).Count
-                    }
-                }
-
-                $rows.Add([PSCustomObject]@{
-                    id = $index
-                    calendarName = [string]$target.Name
-                    calendarEmail = [string]$target.Email
-                    calendarKey = [string]$target.Key
-                    calendarKind = [string]$target.Kind
-                    startISO = $startDt.ToString("yyyy-MM-ddTHH:mm:ss")
-                    endISO = $endDt.ToString("yyyy-MM-ddTHH:mm:ss")
-                    date = $startDt.ToString("yyyy-MM-dd")
-                    startHM = if ($allDay) { "終日" } else { $startDt.ToString("HH:mm") }
-                    endHM = if ($allDay) { "" } else { $endDt.ToString("HH:mm") }
-                    subject = Normalize-Text $subject
-                    location = Normalize-Text $location
-                    organizer = Normalize-Text $organizer
-                    requiredAttendees = Normalize-Text $requiredAttendees
-                    optionalAttendees = Normalize-Text $optionalAttendees
-                    attendeeCount = $attendeeCount
-                    categories = Normalize-Text $categories
-                    bodyPreview = Normalize-Text $bodyPreview
-                    isPrivate = $isPrivate
-                    isMasked = $shouldMask
-                    allDay = $allDay
-                    busyStatus = $busyStatus
-                    importance = $importance
-                    meetingStatus = $meetingStatus
-                    reminder = $reminderText
-                    isRecurring = $isRecurring
-                    durationMinutes = $durationMinutes
-                })
-                $index += 1
+                $index = Add-AppointmentRow -Rows $rows -Appointment $appointment -Target $target -RangeStart $rangeStart -RangeEnd $rangeEnd -Index $index -Settings $settings
             } catch {
                 Write-Log "Skipped one appointment in '$($target.Name)': $($_.Exception.Message)" "WARN"
             }
@@ -332,11 +402,7 @@ try {
     $safeTitle = HtmlEncode $title
 
     $htmlTemplate = @'
-<!doctype html><html lang="ja"><head><meta charset="utf-8"><title>__TITLE__</title><meta name="viewport" content="width=device-width,initial-scale=1"><style>
-:root{--bg:#f5f6f8;--card:#fff;--text:#1f2937;--muted:#6b7280;--line:#e5e7eb;--accent:#2563eb;--soft:#dbeafe;--private:#f3f4f6;--today:#fff7ed;--shadow:0 20px 50px rgba(15,23,42,.18)}*{box-sizing:border-box}body{margin:0;font-family:system-ui,-apple-system,"Segoe UI",sans-serif;background:var(--bg);color:var(--text)}header{position:sticky;top:0;z-index:10;background:rgba(245,246,248,.96);border-bottom:1px solid var(--line);backdrop-filter:blur(8px)}.wrap{max-width:1120px;margin:auto;padding:18px}h1{margin:0 0 6px;font-size:22px}.meta{font-size:13px;color:var(--muted)}.summary{display:grid;grid-template-columns:repeat(3,1fr);gap:10px;margin:14px 0}.box,.event{background:var(--card);border:1px solid var(--line);border-radius:14px}.box{padding:12px}.label{font-size:12px;color:var(--muted)}.value{margin-top:4px;font-size:18px;font-weight:700;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}.controls,.filters{display:flex;gap:8px;flex-wrap:wrap;margin-top:8px}button,input{font:inherit}button{border:1px solid var(--line);background:white;border-radius:999px;padding:8px 12px;cursor:pointer}button.active{border-color:var(--accent);background:var(--soft);color:var(--accent);font-weight:700}input{flex:1;min-width:230px;border:1px solid var(--line);border-radius:999px;padding:8px 13px}main{max-width:1120px;margin:auto;padding:18px}.day{margin-bottom:18px}.day.today{background:var(--today);border:1px solid #fed7aa;border-radius:16px;padding:10px 12px 4px}.day-title{display:flex;gap:10px;align-items:baseline;margin:20px 0 8px}.day-title h2{margin:0;font-size:18px}.count{font-size:13px;color:var(--muted)}.event{display:grid;grid-template-columns:92px 1fr auto;gap:12px;align-items:start;padding:12px;margin:8px 0;cursor:pointer;transition:.12s}.event:hover{border-color:#bfdbfe;transform:translateY(-1px)}.event.private{background:var(--private)}.time{text-align:center;color:var(--accent);font-weight:700}.end{display:block;color:var(--muted);font-size:12px;font-weight:500;margin-top:3px}.subject{font-weight:700;line-height:1.35}.sub{margin-top:5px;color:var(--muted);font-size:13px}.badges{display:flex;flex-wrap:wrap;gap:7px;margin-top:7px;font-size:12px}.badge{border:1px solid var(--line);border-radius:999px;padding:2px 8px;background:white;color:var(--muted)}.owner{border-color:#bfdbfe;background:#eff6ff;color:#1d4ed8}.open{color:var(--accent);font-weight:700;font-size:13px}.empty{background:white;border:1px dashed var(--line);border-radius:14px;padding:28px;text-align:center;color:var(--muted)}.backdrop{position:fixed;inset:0;background:rgba(15,23,42,.32);z-index:20;display:none}.backdrop.on{display:block}.panel{position:fixed;right:18px;top:18px;bottom:18px;width:min(560px,calc(100vw - 36px));background:white;border:1px solid var(--line);border-radius:20px;box-shadow:var(--shadow);z-index:21;display:none;overflow:hidden}.panel.on{display:flex;flex-direction:column}.panel-head{padding:18px;border-bottom:1px solid var(--line);display:flex;justify-content:space-between;gap:12px}.panel-title{font-size:18px;font-weight:800;line-height:1.35}.hint{font-size:12px;color:var(--muted);margin-top:8px}.panel-body{padding:18px;overflow:auto}.kv dt{font-size:12px;color:var(--muted);margin-bottom:3px}.kv dd{margin:0 0 14px;white-space:pre-wrap;line-height:1.5}.close{border-radius:10px}@media(max-width:720px){.summary{grid-template-columns:1fr}.event{grid-template-columns:1fr}.time{text-align:left}.open{display:none}.panel{left:8px;right:8px;top:auto;bottom:8px;width:auto;max-height:88vh}}@media print{header{position:static}.controls,.filters,.backdrop,.panel,.open{display:none!important}body{background:white}.event,.box{break-inside:avoid}}
-</style></head><body><header><div class="wrap"><h1>__TITLE__</h1><div class="meta">Last updated: __UPDATED__</div><div class="summary"><div class="box"><div class="label">今日の予定</div><div class="value" id="todayCount">-</div></div><div class="box"><div class="label">表示中の予定</div><div class="value" id="totalCount">-</div></div><div class="box"><div class="label">次の予定</div><div class="value" id="nextEvent">-</div></div></div><div class="controls"><button id="btnToday" class="active">今日</button><button id="btnAll">すべて</button><button id="btnPrint">印刷</button><input id="search" type="search" placeholder="予定表・件名・場所・参加者・本文を検索"></div><div id="filters" class="filters"></div></div></header><main id="app"></main><div id="backdrop" class="backdrop"></div><aside id="panel" class="panel"><div class="panel-head"><div><div id="panelTitle" class="panel-title"></div><div id="panelHint" class="hint"></div></div><button id="btnClose" class="close">閉じる</button></div><div id="panelBody" class="panel-body"></div></aside><script id="schedule-data" type="application/json">__DATA__</script><script>
-const events=JSON.parse(document.getElementById('schedule-data').textContent||'[]');const app=document.getElementById('app'),search=document.getElementById('search'),filters=document.getElementById('filters'),panel=document.getElementById('panel'),backdrop=document.getElementById('backdrop');let mode='today',cal='all';const pad=n=>String(n).padStart(2,'0'),today=()=>{const d=new Date();return `${d.getFullYear()}-${pad(d.getMonth()+1)}-${pad(d.getDate())}`},fmt=s=>new Intl.DateTimeFormat('ja-JP',{month:'numeric',day:'numeric',weekday:'short'}).format(new Date(s+'T00:00:00')),el=(t,c,x)=>{const e=document.createElement(t);if(c)e.className=c;if(x!=null)e.textContent=x;return e};function calendarList(){const m=new Map();for(const e of events){const k=e.calendarKey||'default';if(!m.has(k))m.set(k,{key:k,name:e.calendarName||'予定表',count:0});m.get(k).count++}return [...m.values()].sort((a,b)=>a.name.localeCompare(b.name,'ja'))}function drawFilters(){filters.innerHTML='';const all=el('button','',`全員 (${events.length})`);all.onclick=()=>{cal='all';drawFilters();update();render()};filters.appendChild(all);for(const c of calendarList()){const b=el('button','',`${c.name} (${c.count})`);b.onclick=()=>{cal=c.key;drawFilters();update();render()};b.classList.toggle('active',cal===c.key);filters.appendChild(b)}all.classList.toggle('active',cal==='all')}function pool(){return events.filter(e=>cal==='all'||e.calendarKey===cal)}function filtered(){const q=search.value.trim().toLowerCase(),t=today();return pool().filter(e=>{if(mode==='today'&&e.date!==t)return false;if(!q)return true;return [e.calendarName,e.subject,e.location,e.organizer,e.requiredAttendees,e.optionalAttendees,e.categories,e.bodyPreview,e.busyStatus].join(' ').toLowerCase().includes(q)})}function update(){const p=pool(),f=filtered(),n=p.filter(e=>new Date(e.endISO)>=new Date()).sort((a,b)=>new Date(a.startISO)-new Date(b.startISO))[0];document.getElementById('todayCount').textContent=p.filter(e=>e.date===today()).length+'件';document.getElementById('totalCount').textContent=f.length+'件';document.getElementById('nextEvent').textContent=n?`${n.startHM} ${n.calendarName}: ${n.subject}`:'なし'}function render(){app.innerHTML='';document.getElementById('btnToday').classList.toggle('active',mode==='today');document.getElementById('btnAll').classList.toggle('active',mode==='all');const list=filtered();if(!list.length){app.appendChild(el('div','empty','表示する予定がありません。'));return}const g=new Map();for(const e of list){if(!g.has(e.date))g.set(e.date,[]);g.get(e.date).push(e)}for(const [d,items] of g){const sec=el('section','day'+(d===today()?' today':'')),h=el('div','day-title');h.appendChild(el('h2','',fmt(d)));h.appendChild(el('span','count',items.length+'件'));sec.appendChild(h);for(const e of items)sec.appendChild(card(e));app.appendChild(sec)}}function card(e){const c=el('article','event'+(e.isPrivate?' private':''));c.tabIndex=0;c.onclick=()=>detail(e);c.onkeydown=x=>{if(x.key==='Enter'||x.key===' '){x.preventDefault();detail(e)}};const tm=el('div','time',e.startHM);if(!e.allDay&&e.endHM)tm.appendChild(el('span','end','〜 '+e.endHM));const b=el('div','');b.appendChild(el('div','subject',e.subject));const sub=[e.location?'📍 '+e.location:'',e.organizer?'主催: '+e.organizer:''].filter(Boolean).join(' / ');if(sub)b.appendChild(el('div','sub',sub));const bs=el('div','badges');bs.appendChild(el('span','badge owner','👤 '+(e.calendarName||'予定表')));for(const x of [e.busyStatus,e.meetingStatus,e.attendeeCount?`参加者 ${e.attendeeCount}名`:'',e.allDay?'終日':'',e.isRecurring?'繰り返し':'',e.importance==='高'?'重要度 高':''].filter(Boolean))bs.appendChild(el('span','badge',x));b.appendChild(bs);c.appendChild(tm);c.appendChild(b);c.appendChild(el('div','open','詳細'));return c}function detail(e){document.getElementById('panelTitle').textContent=e.subject;document.getElementById('panelHint').textContent=e.isMasked?'非公開予定のため詳細はマスクされています。':'カード外または Esc で閉じます。';const rows=[['予定表',e.calendarName],['予定表メール',e.calendarEmail],['日時',`${fmt(e.date)} ${e.startHM}${e.endHM?' 〜 '+e.endHM:''}`],['所要時間',e.allDay?'終日':`${e.durationMinutes}分`],['場所',e.location],['主催者',e.organizer],['必須参加者',e.requiredAttendees],['任意参加者',e.optionalAttendees],['状態',e.busyStatus],['会議状態',e.meetingStatus],['重要度',e.importance],['リマインダー',e.reminder],['分類',e.categories],['本文プレビュー',e.bodyPreview]].filter(r=>r[1]);const dl=el('dl','kv');for(const [k,v]of rows){dl.appendChild(el('dt','',k));dl.appendChild(el('dd','',v))}document.getElementById('panelBody').innerHTML='';document.getElementById('panelBody').appendChild(dl);panel.classList.add('on');backdrop.classList.add('on')}function close(){panel.classList.remove('on');backdrop.classList.remove('on')}document.getElementById('btnToday').onclick=()=>{mode='today';update();render()};document.getElementById('btnAll').onclick=()=>{mode='all';update();render()};document.getElementById('btnPrint').onclick=()=>window.print();document.getElementById('btnClose').onclick=close;backdrop.onclick=close;search.oninput=()=>{update();render()};document.addEventListener('keydown',e=>{if(e.key==='Escape')close()});drawFilters();update();render();
-</script></body></html>
+<!doctype html><html lang="ja"><head><meta charset="utf-8"><title>__TITLE__</title><meta name="viewport" content="width=device-width,initial-scale=1"><style>:root{--bg:#f5f6f8;--card:#fff;--text:#1f2937;--muted:#6b7280;--line:#e5e7eb;--accent:#2563eb;--soft:#dbeafe;--private:#f3f4f6;--today:#fff7ed;--shadow:0 20px 50px rgba(15,23,42,.18)}*{box-sizing:border-box}body{margin:0;font-family:system-ui,-apple-system,"Segoe UI",sans-serif;background:var(--bg);color:var(--text)}header{position:sticky;top:0;z-index:10;background:rgba(245,246,248,.96);border-bottom:1px solid var(--line);backdrop-filter:blur(8px)}.wrap{max-width:1120px;margin:auto;padding:18px}h1{margin:0 0 6px;font-size:22px}.meta{font-size:13px;color:var(--muted)}.summary{display:grid;grid-template-columns:repeat(3,1fr);gap:10px;margin:14px 0}.box,.event{background:var(--card);border:1px solid var(--line);border-radius:14px}.box{padding:12px}.label{font-size:12px;color:var(--muted)}.value{margin-top:4px;font-size:18px;font-weight:700;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}.controls,.filters{display:flex;gap:8px;flex-wrap:wrap;margin-top:8px}button,input{font:inherit}button{border:1px solid var(--line);background:white;border-radius:999px;padding:8px 12px;cursor:pointer}button.active{border-color:var(--accent);background:var(--soft);color:var(--accent);font-weight:700}input{flex:1;min-width:230px;border:1px solid var(--line);border-radius:999px;padding:8px 13px}main{max-width:1120px;margin:auto;padding:18px}.day{margin-bottom:18px}.day.today{background:var(--today);border:1px solid #fed7aa;border-radius:16px;padding:10px 12px 4px}.day-title{display:flex;gap:10px;align-items:baseline;margin:20px 0 8px}.day-title h2{margin:0;font-size:18px}.count{font-size:13px;color:var(--muted)}.event{display:grid;grid-template-columns:92px 1fr auto;gap:12px;align-items:start;padding:12px;margin:8px 0;cursor:pointer;transition:.12s}.event:hover{border-color:#bfdbfe;transform:translateY(-1px)}.event.private{background:var(--private)}.time{text-align:center;color:var(--accent);font-weight:700}.end{display:block;color:var(--muted);font-size:12px;font-weight:500;margin-top:3px}.subject{font-weight:700;line-height:1.35}.sub{margin-top:5px;color:var(--muted);font-size:13px}.badges{display:flex;flex-wrap:wrap;gap:7px;margin-top:7px;font-size:12px}.badge{border:1px solid var(--line);border-radius:999px;padding:2px 8px;background:white;color:var(--muted)}.owner{border-color:#bfdbfe;background:#eff6ff;color:#1d4ed8}.open{color:var(--accent);font-weight:700;font-size:13px}.empty{background:white;border:1px dashed var(--line);border-radius:14px;padding:28px;text-align:center;color:var(--muted)}.backdrop{position:fixed;inset:0;background:rgba(15,23,42,.32);z-index:20;display:none}.backdrop.on{display:block}.panel{position:fixed;right:18px;top:18px;bottom:18px;width:min(560px,calc(100vw - 36px));background:white;border:1px solid var(--line);border-radius:20px;box-shadow:var(--shadow);z-index:21;display:none;overflow:hidden}.panel.on{display:flex;flex-direction:column}.panel-head{padding:18px;border-bottom:1px solid var(--line);display:flex;justify-content:space-between;gap:12px}.panel-title{font-size:18px;font-weight:800;line-height:1.35}.hint{font-size:12px;color:var(--muted);margin-top:8px}.panel-body{padding:18px;overflow:auto}.kv dt{font-size:12px;color:var(--muted);margin-bottom:3px}.kv dd{margin:0 0 14px;white-space:pre-wrap;line-height:1.5}.close{border-radius:10px}@media(max-width:720px){.summary{grid-template-columns:1fr}.event{grid-template-columns:1fr}.time{text-align:left}.open{display:none}.panel{left:8px;right:8px;top:auto;bottom:8px;width:auto;max-height:88vh}}@media print{header{position:static}.controls,.filters,.backdrop,.panel,.open{display:none!important}body{background:white}.event,.box{break-inside:avoid}}</style></head><body><header><div class="wrap"><h1>__TITLE__</h1><div class="meta">Last updated: __UPDATED__</div><div class="summary"><div class="box"><div class="label">今日の予定</div><div class="value" id="todayCount">-</div></div><div class="box"><div class="label">表示中の予定</div><div class="value" id="totalCount">-</div></div><div class="box"><div class="label">次の予定</div><div class="value" id="nextEvent">-</div></div></div><div class="controls"><button id="btnToday" class="active">今日</button><button id="btnAll">すべて</button><button id="btnPrint">印刷</button><input id="search" type="search" placeholder="予定表・件名・場所・参加者・本文を検索"></div><div id="filters" class="filters"></div></div></header><main id="app"></main><div id="backdrop" class="backdrop"></div><aside id="panel" class="panel"><div class="panel-head"><div><div id="panelTitle" class="panel-title"></div><div id="panelHint" class="hint"></div></div><button id="btnClose" class="close">閉じる</button></div><div id="panelBody" class="panel-body"></div></aside><script id="schedule-data" type="application/json">__DATA__</script><script>const events=JSON.parse(document.getElementById('schedule-data').textContent||'[]');const app=document.getElementById('app'),search=document.getElementById('search'),filters=document.getElementById('filters'),panel=document.getElementById('panel'),backdrop=document.getElementById('backdrop');let mode='today',cal='all';const pad=n=>String(n).padStart(2,'0'),today=()=>{const d=new Date();return `${d.getFullYear()}-${pad(d.getMonth()+1)}-${pad(d.getDate())}`},fmt=s=>new Intl.DateTimeFormat('ja-JP',{month:'numeric',day:'numeric',weekday:'short'}).format(new Date(s+'T00:00:00')),el=(t,c,x)=>{const e=document.createElement(t);if(c)e.className=c;if(x!=null)e.textContent=x;return e};function calendarList(){const m=new Map();for(const e of events){const k=e.calendarKey||'default';if(!m.has(k))m.set(k,{key:k,name:e.calendarName||'予定表',count:0});m.get(k).count++}return [...m.values()].sort((a,b)=>a.name.localeCompare(b.name,'ja'))}function drawFilters(){filters.innerHTML='';const all=el('button','',`全員 (${events.length})`);all.onclick=()=>{cal='all';drawFilters();update();render()};filters.appendChild(all);for(const c of calendarList()){const b=el('button','',`${c.name} (${c.count})`);b.onclick=()=>{cal=c.key;drawFilters();update();render()};b.classList.toggle('active',cal===c.key);filters.appendChild(b)}all.classList.toggle('active',cal==='all')}function pool(){return events.filter(e=>cal==='all'||e.calendarKey===cal)}function filtered(){const q=search.value.trim().toLowerCase(),t=today();return pool().filter(e=>{if(mode==='today'&&e.date!==t)return false;if(!q)return true;return [e.calendarName,e.subject,e.location,e.organizer,e.requiredAttendees,e.optionalAttendees,e.categories,e.bodyPreview,e.busyStatus].join(' ').toLowerCase().includes(q)})}function update(){const p=pool(),f=filtered(),n=p.filter(e=>new Date(e.endISO)>=new Date()).sort((a,b)=>new Date(a.startISO)-new Date(b.startISO))[0];document.getElementById('todayCount').textContent=p.filter(e=>e.date===today()).length+'件';document.getElementById('totalCount').textContent=f.length+'件';document.getElementById('nextEvent').textContent=n?`${n.startHM} ${n.calendarName}: ${n.subject}`:'なし'}function render(){app.innerHTML='';document.getElementById('btnToday').classList.toggle('active',mode==='today');document.getElementById('btnAll').classList.toggle('active',mode==='all');const list=filtered();if(!list.length){app.appendChild(el('div','empty','表示する予定がありません。'));return}const g=new Map();for(const e of list){if(!g.has(e.date))g.set(e.date,[]);g.get(e.date).push(e)}for(const [d,items] of g){const sec=el('section','day'+(d===today()?' today':'')),h=el('div','day-title');h.appendChild(el('h2','',fmt(d)));h.appendChild(el('span','count',items.length+'件'));sec.appendChild(h);for(const e of items)sec.appendChild(card(e));app.appendChild(sec)}}function card(e){const c=el('article','event'+(e.isPrivate?' private':''));c.tabIndex=0;c.onclick=()=>detail(e);c.onkeydown=x=>{if(x.key==='Enter'||x.key===' '){x.preventDefault();detail(e)}};const tm=el('div','time',e.startHM);if(!e.allDay&&e.endHM)tm.appendChild(el('span','end','〜 '+e.endHM));const b=el('div','');b.appendChild(el('div','subject',e.subject));const sub=[e.location?'📍 '+e.location:'',e.organizer?'主催: '+e.organizer:''].filter(Boolean).join(' / ');if(sub)b.appendChild(el('div','sub',sub));const bs=el('div','badges');bs.appendChild(el('span','badge owner','👤 '+(e.calendarName||'予定表')));for(const x of [e.busyStatus,e.meetingStatus,e.attendeeCount?`参加者 ${e.attendeeCount}名`:'',e.allDay?'終日':'',e.isRecurring?'繰り返し':'',e.importance==='高'?'重要度 高':''].filter(Boolean))bs.appendChild(el('span','badge',x));b.appendChild(bs);c.appendChild(tm);c.appendChild(b);c.appendChild(el('div','open','詳細'));return c}function detail(e){document.getElementById('panelTitle').textContent=e.subject;document.getElementById('panelHint').textContent=e.isMasked?'非公開予定のため詳細はマスクされています。':'カード外または Esc で閉じます。';const rows=[['予定表',e.calendarName],['予定表メール',e.calendarEmail],['日時',`${fmt(e.date)} ${e.startHM}${e.endHM?' 〜 '+e.endHM:''}`],['所要時間',e.allDay?'終日':`${e.durationMinutes}分`],['場所',e.location],['主催者',e.organizer],['必須参加者',e.requiredAttendees],['任意参加者',e.optionalAttendees],['状態',e.busyStatus],['会議状態',e.meetingStatus],['重要度',e.importance],['リマインダー',e.reminder],['分類',e.categories],['本文プレビュー',e.bodyPreview]].filter(r=>r[1]);const dl=el('dl','kv');for(const [k,v]of rows){dl.appendChild(el('dt','',k));dl.appendChild(el('dd','',v))}document.getElementById('panelBody').innerHTML='';document.getElementById('panelBody').appendChild(dl);panel.classList.add('on');backdrop.classList.add('on')}function close(){panel.classList.remove('on');backdrop.classList.remove('on')}document.getElementById('btnToday').onclick=()=>{mode='today';update();render()};document.getElementById('btnAll').onclick=()=>{mode='all';update();render()};document.getElementById('btnPrint').onclick=()=>window.print();document.getElementById('btnClose').onclick=close;backdrop.onclick=close;search.oninput=()=>{update();render()};document.addEventListener('keydown',e=>{if(e.key==='Escape')close()});drawFilters();update();render();</script></body></html>
 '@
 
     $html = $htmlTemplate.Replace("__TITLE__", $safeTitle).Replace("__UPDATED__", (HtmlEncode $updatedText)).Replace("__DATA__", $jsonSafe)
@@ -348,6 +414,7 @@ const events=JSON.parse(document.getElementById('schedule-data').textContent||'[
     exit 0
 }
 catch {
-    Write-Log $_.Exception.Message "ERROR"
+    $line = if ($_.InvocationInfo) { $_.InvocationInfo.ScriptLineNumber } else { "unknown" }
+    Write-Log "Line $line: $($_.Exception.Message)" "ERROR"
     exit 1
 }
