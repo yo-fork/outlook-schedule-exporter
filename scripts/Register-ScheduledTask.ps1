@@ -1,4 +1,4 @@
-param(
+﻿param(
     [string]$ConfigPath = (Join-Path (Split-Path -Parent $PSScriptRoot) "config.json"),
     [int]$IntervalMinutes = 30,
     [string]$TaskName = "Export Outlook Schedule"
