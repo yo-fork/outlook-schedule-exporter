@@ -9,6 +9,12 @@
   "MaskPrivateItems": true,
   "IncludeLocation": true,
   "IncludeBusyStatus": true,
+  "IncludeOrganizer": true,
+  "IncludeAttendees": true,
+  "IncludeBodyPreview": false,
+  "BodyPreviewMaxLength": 700,
+  "IncludeCategories": true,
+  "IncludeReminder": true,
   "DateFormat": "yyyy/MM/dd",
   "TimeFormat": "HH:mm"
 }
