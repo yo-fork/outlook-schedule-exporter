@@ -6,6 +6,14 @@
   "DaysAhead": 14,
   "Title": "Outlook Schedule",
   "WriteCsv": true,
+  "IncludeDefaultCalendar": true,
+  "DefaultCalendarName": "自分",
+  "SharedCalendars": [
+    {
+      "Name": "田中さん",
+      "Email": "tanaka@example.com"
+    }
+  ],
   "MaskPrivateItems": true,
   "IncludeLocation": true,
   "IncludeBusyStatus": true,
